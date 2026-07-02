@@ -1,7 +1,4 @@
-# Docs for the Azure Web Apps Deploy action: https://github.com/Azure/webapps-deploy
-# More GitHub Actions for Azure: https://github.com/Azure/actions
-
-name: Build and deploy Node.js app to Azure Web App - tino-telebot
+name: Build and deploy Tino Telegram Bot
 
 on:
   push:
@@ -9,45 +6,98 @@ on:
       - main
   workflow_dispatch:
 
+concurrency:
+  group: tino-telebot-production
+  cancel-in-progress: true
+
+env:
+  AZURE_WEBAPP_NAME: tino-telebot
+  WEBJOB_NAME: tino-telebot
+  NODE_VERSION: "22"
+  PNPM_VERSION: "11.9.0"
+
 jobs:
   build:
     runs-on: ubuntu-latest
     permissions:
-      contents: read #This is required for actions/checkout
+      contents: read
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - name: Set up Node.js version
-        uses: actions/setup-node@v3
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
         with:
-          node-version: '22.x'
+          version: ${{ env.PNPM_VERSION }}
+          run_install: false
 
-      - name: npm install, build, and test
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck
+        run: pnpm typecheck
+
+      - name: Build
+        run: pnpm build
+
+      - name: Assemble continuous WebJob
+        shell: bash
         run: |
-          npm install
-          npm run build --if-present
-          npm run test --if-present
+          set -euo pipefail
 
-      - name: Upload artifact for deployment job
+          job_dir="$RUNNER_TEMP/webjob-package/App_Data/jobs/continuous/${WEBJOB_NAME}"
+          mkdir -p "$job_dir"
+
+          cp -R dist "$job_dir/dist"
+          cp package.json pnpm-lock.yaml pnpm-workspace.yaml "$job_dir/"
+
+          cat > "$job_dir/run.js" <<'EOF'
+          import "./dist/index.js";
+          EOF
+
+          cat > "$job_dir/settings.job" <<'EOF'
+          {
+            "is_singleton": true
+          }
+          EOF
+
+          (
+            cd "$job_dir"
+            pnpm install \
+              --prod \
+              --frozen-lockfile \
+              --config.node-linker=hoisted
+          )
+
+      - name: Upload deployment artifact
         uses: actions/upload-artifact@v4
         with:
-          name: node-app
-          path: .
+          name: tino-telebot-webjob
+          path: ${{ runner.temp }}/webjob-package
+          if-no-files-found: error
+          retention-days: 1
 
   deploy:
     runs-on: ubuntu-latest
     needs: build
     permissions:
-      id-token: write #This is required for requesting the JWT
-      contents: read #This is required for actions/checkout
+      id-token: write
+      contents: read
 
     steps:
-      - name: Download artifact from build job
+      - name: Download deployment artifact
         uses: actions/download-artifact@v4
         with:
-          name: node-app
-      
+          name: tino-telebot-webjob
+          path: webjob-package
+
       - name: Login to Azure
         uses: azure/login@v2
         with:
@@ -55,11 +105,112 @@ jobs:
           tenant-id: ${{ secrets.AZUREAPPSERVICE_TENANTID_81CF8CF6F3BC4D7D9913C34551FE9BE1 }}
           subscription-id: ${{ secrets.AZUREAPPSERVICE_SUBSCRIPTIONID_80FAD3DB46C944A3935C499236ECA924 }}
 
-      - name: 'Deploy to Azure Web App'
-        id: deploy-to-webapp
+      - name: Resolve Azure Web App
+        id: azure-app
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          resource_group="$(
+            az webapp list \
+              --query "[?name=='${AZURE_WEBAPP_NAME}'].resourceGroup | [0]" \
+              --output tsv
+          )"
+
+          if [ -z "$resource_group" ]; then
+            echo "Azure Web App '${AZURE_WEBAPP_NAME}' was not found." >&2
+            exit 1
+          fi
+
+          echo "resource-group=$resource_group" >> "$GITHUB_OUTPUT"
+
+      - name: Validate bot application settings
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          configured_names="$(
+            az webapp config appsettings list \
+              --resource-group "${{ steps.azure-app.outputs.resource-group }}" \
+              --name "$AZURE_WEBAPP_NAME" \
+              --query "[].name" \
+              --output tsv
+          )"
+
+          missing=0
+          for name in \
+            TELEGRAM_BOT_TOKEN \
+            TINO_API_BASE_URL \
+            TINO_BOT_SERVICE_SECRET
+          do
+            if ! grep -Fxq "$name" <<< "$configured_names"; then
+              echo "Missing Azure App Setting: $name" >&2
+              missing=1
+            fi
+          done
+
+          if [ "$missing" -ne 0 ]; then
+            exit 1
+          fi
+
+      - name: Configure continuous WebJob host
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          az webapp config set \
+            --resource-group "${{ steps.azure-app.outputs.resource-group }}" \
+            --name "$AZURE_WEBAPP_NAME" \
+            --always-on true \
+            --output none
+
+          az webapp config appsettings set \
+            --resource-group "${{ steps.azure-app.outputs.resource-group }}" \
+            --name "$AZURE_WEBAPP_NAME" \
+            --settings \
+              WEBJOBS_RUN_ONCE=1 \
+              TZ=Asia/Bangkok \
+            --output none
+
+      - name: Deploy continuous WebJob
         uses: azure/webapps-deploy@v3
         with:
-          app-name: 'tino-telebot'
-          slot-name: 'Production'
-          package: .
-          
+          app-name: ${{ env.AZURE_WEBAPP_NAME }}
+          slot-name: Production
+          package: webjob-package
+
+      - name: Verify WebJob
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          resource_group="${{ steps.azure-app.outputs.resource-group }}"
+
+          for attempt in $(seq 1 12); do
+            status="$(
+              az webapp webjob continuous list \
+                --resource-group "$resource_group" \
+                --name "$AZURE_WEBAPP_NAME" \
+                --query "[?name=='${WEBJOB_NAME}'].status | [0]" \
+                --output tsv
+            )"
+
+            if [ "$status" = "Running" ]; then
+              echo "Continuous WebJob '${WEBJOB_NAME}' is running."
+              exit 0
+            fi
+
+            if [ -n "$status" ] && [ "$status" != "Running" ]; then
+              az webapp webjob continuous start \
+                --resource-group "$resource_group" \
+                --name "$AZURE_WEBAPP_NAME" \
+                --webjob-name "$WEBJOB_NAME" \
+                --output none || true
+            fi
+
+            echo "Attempt ${attempt}/12: WebJob status is '${status:-unavailable}'."
+            sleep 10
+          done
+
+          echo "Continuous WebJob did not reach Running state." >&2
+          exit 1
