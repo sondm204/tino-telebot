@@ -1,4 +1,5 @@
 import { randomBytes } from 'node:crypto';
+import { createServer } from 'node:http';
 import { Markup, Telegraf } from 'telegraf';
 import type { Context } from 'telegraf';
 import { config } from './config.js';
@@ -7,6 +8,31 @@ import { tinoApi, TinoApiError } from './tino-api.js';
 
 const bot = new Telegraf(config.botToken);
 const PENDING_TTL_MS = 5 * 60_000;
+const port = Number(process.env.PORT || 8080);
+let botReady = false;
+
+const server = createServer((request, response) => {
+  response.setHeader('content-type', 'application/json; charset=utf-8');
+
+  if (request.url === '/health') {
+    response.statusCode = botReady ? 200 : 503;
+    response.end(
+      JSON.stringify({
+        status: botReady ? 'ok' : 'starting',
+        service: 'tino-telebot',
+      })
+    );
+    return;
+  }
+
+  response.statusCode = 200;
+  response.end(
+    JSON.stringify({
+      service: 'tino-telebot',
+      status: botReady ? 'running' : 'starting',
+    })
+  );
+});
 
 type PendingExpense = {
   chatId: string;
@@ -269,6 +295,14 @@ bot.catch((error, ctx) => {
   console.error(`Telegram update ${ctx.update.update_id} failed`, error);
 });
 
+await new Promise<void>((resolve, reject) => {
+  server.once('error', reject);
+  server.listen(port, '0.0.0.0', () => {
+    server.off('error', reject);
+    resolve();
+  });
+});
+
 await bot.telegram.setMyCommands([
   { command: 'link', description: 'Liên kết tài khoản Tino' },
   { command: 'connect', description: 'Kết nối nhóm với ví' },
@@ -277,7 +311,14 @@ await bot.telegram.setMyCommands([
 ]);
 
 await bot.launch();
+botReady = true;
 console.log('Tino Telegram bot is running');
 
-process.once('SIGINT', () => bot.stop('SIGINT'));
-process.once('SIGTERM', () => bot.stop('SIGTERM'));
+function shutdown(signal: 'SIGINT' | 'SIGTERM') {
+  botReady = false;
+  bot.stop(signal);
+  server.close();
+}
+
+process.once('SIGINT', () => shutdown('SIGINT'));
+process.once('SIGTERM', () => shutdown('SIGTERM'));

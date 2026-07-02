@@ -12,7 +12,6 @@ concurrency:
 
 env:
   AZURE_WEBAPP_NAME: tino-telebot
-  WEBJOB_NAME: tino-telebot
   NODE_VERSION: "22"
   PNPM_VERSION: "11.9.0"
 
@@ -39,7 +38,7 @@ jobs:
           cache: pnpm
 
       - name: Install dependencies
-        run: pnpm install --frozen-lockfile
+        run: pnpm install --frozen-lockfile --config.node-linker=hoisted
 
       - name: Typecheck
         run: pnpm typecheck
@@ -47,40 +46,22 @@ jobs:
       - name: Build
         run: pnpm build
 
-      - name: Assemble continuous WebJob
+      - name: Remove development dependencies
+        run: pnpm prune --prod --config.node-linker=hoisted
+
+      - name: Create deployment package
         shell: bash
         run: |
           set -euo pipefail
-
-          job_dir="$RUNNER_TEMP/webjob-package/App_Data/jobs/continuous/${WEBJOB_NAME}"
-          mkdir -p "$job_dir"
-
-          cp -R dist "$job_dir/dist"
-          cp package.json pnpm-lock.yaml pnpm-workspace.yaml "$job_dir/"
-
-          cat > "$job_dir/run.js" <<'EOF'
-          import "./dist/index.js";
-          EOF
-
-          cat > "$job_dir/settings.job" <<'EOF'
-          {
-            "is_singleton": true
-          }
-          EOF
-
-          (
-            cd "$job_dir"
-            pnpm install \
-              --prod \
-              --frozen-lockfile \
-              --config.node-linker=hoisted
-          )
+          mkdir -p release
+          cp -R dist node_modules package.json pnpm-lock.yaml web.config release/
+          tar -czf tino-telebot-release.tar.gz -C release .
 
       - name: Upload deployment artifact
         uses: actions/upload-artifact@v4
         with:
-          name: tino-telebot-webjob
-          path: ${{ runner.temp }}/webjob-package
+          name: tino-telebot-release
+          path: tino-telebot-release.tar.gz
           if-no-files-found: error
           retention-days: 1
 
@@ -95,8 +76,14 @@ jobs:
       - name: Download deployment artifact
         uses: actions/download-artifact@v4
         with:
-          name: tino-telebot-webjob
-          path: webjob-package
+          name: tino-telebot-release
+
+      - name: Extract deployment package
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          tar -xzf tino-telebot-release.tar.gz -C release
 
       - name: Login to Azure
         uses: azure/login@v2
@@ -122,7 +109,56 @@ jobs:
             exit 1
           fi
 
+          hostname="$(
+            az webapp show \
+              --resource-group "$resource_group" \
+              --name "$AZURE_WEBAPP_NAME" \
+              --query defaultHostName \
+              --output tsv
+          )"
+
+          is_linux="$(
+            az webapp show \
+              --resource-group "$resource_group" \
+              --name "$AZURE_WEBAPP_NAME" \
+              --query reserved \
+              --output tsv
+          )"
+
+          plan_id="$(
+            az webapp show \
+              --resource-group "$resource_group" \
+              --name "$AZURE_WEBAPP_NAME" \
+              --query serverFarmId \
+              --output tsv
+          )"
+          plan_tier="$(
+            az appservice plan show \
+              --ids "$plan_id" \
+              --query sku.tier \
+              --output tsv
+          )"
+
           echo "resource-group=$resource_group" >> "$GITHUB_OUTPUT"
+          echo "hostname=$hostname" >> "$GITHUB_OUTPUT"
+          echo "is-linux=$is_linux" >> "$GITHUB_OUTPUT"
+          echo "plan-tier=$plan_tier" >> "$GITHUB_OUTPUT"
+
+      - name: Validate Azure hosting plan
+        shell: bash
+        run: |
+          set -euo pipefail
+          plan_tier="${{ steps.azure-app.outputs.plan-tier }}"
+
+          case "${plan_tier,,}" in
+            free|shared)
+              echo "Azure App Service plan tier '${plan_tier}' does not support Always On." >&2
+              echo "Upgrade the tino-telebot App Service plan to Basic B1 or higher." >&2
+              exit 1
+              ;;
+          esac
+
+          echo "Azure App Service plan tier: ${plan_tier}"
 
       - name: Validate bot application settings
         shell: bash
@@ -153,76 +189,106 @@ jobs:
             exit 1
           fi
 
-      - name: Configure continuous WebJob host
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          az webapp config set \
-            --resource-group "${{ steps.azure-app.outputs.resource-group }}" \
-            --name "$AZURE_WEBAPP_NAME" \
-            --always-on true \
-            --output none
-
-          az webapp config appsettings set \
-            --resource-group "${{ steps.azure-app.outputs.resource-group }}" \
-            --name "$AZURE_WEBAPP_NAME" \
-            --settings \
-              WEBJOBS_RUN_ONCE=1 \
-              TZ=Asia/Bangkok \
-            --output none
-
-      - name: Deploy continuous WebJob
+      - name: Deploy to Azure Web App
         uses: azure/webapps-deploy@v3
         with:
           app-name: ${{ env.AZURE_WEBAPP_NAME }}
           slot-name: Production
-          package: webjob-package
+          package: release
+          startup-command: node dist/index.js
 
-      - name: Verify WebJob
+      - name: Configure and restart Azure Web App
         shell: bash
+        env:
+          RESOURCE_GROUP: ${{ steps.azure-app.outputs.resource-group }}
+          IS_LINUX: ${{ steps.azure-app.outputs.is-linux }}
         run: |
           set -euo pipefail
 
-          resource_group="${{ steps.azure-app.outputs.resource-group }}"
-          sleep 15
+          if [ "$IS_LINUX" = "true" ]; then
+            az webapp config set \
+              --resource-group "$RESOURCE_GROUP" \
+              --name "$AZURE_WEBAPP_NAME" \
+              --linux-fx-version "NODE|22-lts" \
+              --startup-file "node dist/index.js" \
+              --always-on true \
+              --output none
+          else
+            az webapp config set \
+              --resource-group "$RESOURCE_GROUP" \
+              --name "$AZURE_WEBAPP_NAME" \
+              --always-on true \
+              --output none
+          fi
 
-          for attempt in $(seq 1 12); do
-            error_file="$(mktemp)"
-            status="$(
-              az webapp webjob continuous list \
-                --resource-group "$resource_group" \
-                --name "$AZURE_WEBAPP_NAME" \
-                --query "[?name=='${WEBJOB_NAME}'].status | [0]" \
-                --output tsv \
-                2>"$error_file"
-            )" || true
-            error_message="$(cat "$error_file")"
-            rm -f "$error_file"
+          az webapp config appsettings set \
+            --resource-group "$RESOURCE_GROUP" \
+            --name "$AZURE_WEBAPP_NAME" \
+            --settings \
+              TZ=Asia/Bangkok \
+              WEBSITE_NODE_DEFAULT_VERSION=~22 \
+            --output none
 
-            if [ "$status" = "Running" ]; then
-              echo "Continuous WebJob '${WEBJOB_NAME}' is running."
+          az webapp log config \
+            --resource-group "$RESOURCE_GROUP" \
+            --name "$AZURE_WEBAPP_NAME" \
+            --application-logging filesystem \
+            --level information \
+            --web-server-logging filesystem \
+            --output none
+
+          az webapp restart \
+            --resource-group "$RESOURCE_GROUP" \
+            --name "$AZURE_WEBAPP_NAME" \
+            --output none
+
+      - name: Verify deployment
+        shell: bash
+        env:
+          WEBAPP_URL: https://${{ steps.azure-app.outputs.hostname }}
+        run: |
+          set -euo pipefail
+          health_url="${WEBAPP_URL%/}/health"
+
+          for attempt in $(seq 1 18); do
+            status_code="$(
+              curl \
+                --silent \
+                --show-error \
+                --output health-response.txt \
+                --write-out "%{http_code}" \
+                "$health_url" || true
+            )"
+
+            echo "Attempt ${attempt}/18 returned HTTP ${status_code}"
+            cat health-response.txt || true
+            echo
+
+            if [ "$status_code" = "200" ]; then
               exit 0
             fi
 
-            if [ -n "$status" ] && [ "$status" != "Running" ]; then
-              az webapp webjob continuous start \
-                --resource-group "$resource_group" \
-                --name "$AZURE_WEBAPP_NAME" \
-                --webjob-name "$WEBJOB_NAME" \
-                --output none || true
-            fi
-
-            echo "Attempt ${attempt}/12: WebJob status is '${status:-unavailable}'."
-            if [ -n "$error_message" ]; then
-              echo "$error_message"
-            fi
             sleep 10
           done
 
-          echo "Continuous WebJob did not reach Running state." >&2
-          az webapp webjob continuous list \
-            --resource-group "$resource_group" \
-            --name "$AZURE_WEBAPP_NAME" \
-            --output table || true
+          echo "Telegram bot health check failed." >&2
           exit 1
+
+      - name: Collect Azure startup logs
+        if: failure()
+        shell: bash
+        env:
+          RESOURCE_GROUP: ${{ steps.azure-app.outputs.resource-group }}
+        run: |
+          az webapp log download \
+            --resource-group "$RESOURCE_GROUP" \
+            --name "$AZURE_WEBAPP_NAME" \
+            --log-file azure-webapp-logs.zip || true
+
+          if [ -f azure-webapp-logs.zip ]; then
+            unzip -oq azure-webapp-logs.zip -d azure-webapp-logs
+            find azure-webapp-logs -type f \
+              \( -name "*.log" -o -name "*.txt" \) \
+              -print \
+              -exec tail -n 150 {} \; || true
+          fi
