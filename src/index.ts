@@ -310,9 +310,15 @@ await bot.telegram.setMyCommands([
   { command: 'help', description: 'Xem hướng dẫn' },
 ]);
 
-await bot.launch();
-botReady = true;
-console.log('Tino Telegram bot is running');
+void bot
+  .launch({}, () => {
+    botReady = true;
+    console.log('Tino Telegram bot is running');
+  })
+  .catch((error) => {
+    botReady = false;
+    console.error('Tino Telegram bot failed to launch', error);
+  });
 
 function shutdown(signal: 'SIGINT' | 'SIGTERM') {
   botReady = false;
