@@ -185,15 +185,20 @@ jobs:
           set -euo pipefail
 
           resource_group="${{ steps.azure-app.outputs.resource-group }}"
+          sleep 15
 
           for attempt in $(seq 1 12); do
+            error_file="$(mktemp)"
             status="$(
               az webapp webjob continuous list \
                 --resource-group "$resource_group" \
                 --name "$AZURE_WEBAPP_NAME" \
                 --query "[?name=='${WEBJOB_NAME}'].status | [0]" \
-                --output tsv
-            )"
+                --output tsv \
+                2>"$error_file"
+            )" || true
+            error_message="$(cat "$error_file")"
+            rm -f "$error_file"
 
             if [ "$status" = "Running" ]; then
               echo "Continuous WebJob '${WEBJOB_NAME}' is running."
@@ -209,8 +214,15 @@ jobs:
             fi
 
             echo "Attempt ${attempt}/12: WebJob status is '${status:-unavailable}'."
+            if [ -n "$error_message" ]; then
+              echo "$error_message"
+            fi
             sleep 10
           done
 
           echo "Continuous WebJob did not reach Running state." >&2
+          az webapp webjob continuous list \
+            --resource-group "$resource_group" \
+            --name "$AZURE_WEBAPP_NAME" \
+            --output table || true
           exit 1
