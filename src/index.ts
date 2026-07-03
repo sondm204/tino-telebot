@@ -10,7 +10,7 @@ const bot = new Telegraf(config.botToken);
 const PENDING_TTL_MS = 5 * 60_000;
 const ATTACHMENT_TTL_MS = 5 * 60_000;
 const MAX_ATTACHMENT_SIZE = 10 * 1024 * 1024;
-const port = Number(process.env.PORT || 8080);
+const port = Number(process.env.PORT || 4040);
 let botReady = false;
 
 const server = createServer((request, response) => {
