@@ -8,6 +8,8 @@ import { tinoApi, TinoApiError } from './tino-api.js';
 
 const bot = new Telegraf(config.botToken);
 const PENDING_TTL_MS = 5 * 60_000;
+const ATTACHMENT_TTL_MS = 5 * 60_000;
+const MAX_ATTACHMENT_SIZE = 10 * 1024 * 1024;
 const port = Number(process.env.PORT || 8080);
 let botReady = false;
 
@@ -43,7 +45,78 @@ type PendingExpense = {
   expiresAt: number;
 };
 
+type AttachmentOffer = {
+  expenseId: string;
+  chatId: string;
+  telegramUserId: string;
+  expiresAt: number;
+};
+
+type PendingAttachment = AttachmentOffer;
+
 const pendingExpenses = new Map<string, PendingExpense>();
+const attachmentOffers = new Map<string, AttachmentOffer>();
+const pendingAttachments = new Map<string, PendingAttachment>();
+const pendingCleanupTimer = setInterval(() => {
+  const now = Date.now();
+
+  for (const [token, pending] of pendingExpenses) {
+    if (pending.expiresAt <= now) pendingExpenses.delete(token);
+  }
+
+  for (const [token, offer] of attachmentOffers) {
+    if (offer.expiresAt <= now) attachmentOffers.delete(token);
+  }
+
+  for (const [key, pending] of pendingAttachments) {
+    if (pending.expiresAt <= now) pendingAttachments.delete(key);
+  }
+}, 60_000);
+pendingCleanupTimer.unref();
+
+function attachmentKey(chatId: string, telegramUserId: string) {
+  return `${chatId}:${telegramUserId}`;
+}
+
+function isOwnedAttachmentState(
+  state: AttachmentOffer | undefined,
+  chatId: string,
+  telegramUserId: string
+) {
+  return (
+    state &&
+    state.expiresAt > Date.now() &&
+    state.chatId === chatId &&
+    state.telegramUserId === telegramUserId
+  );
+}
+
+async function downloadTelegramPhoto(fileUrl: URL) {
+  const response = await fetch(fileUrl, {
+    signal: AbortSignal.timeout(30_000),
+  });
+
+  if (!response.ok) {
+    throw new Error(`Telegram file download failed with HTTP ${response.status}`);
+  }
+
+  const declaredSize = Number(response.headers.get('content-length') || 0);
+
+  if (declaredSize > MAX_ATTACHMENT_SIZE) {
+    throw new Error('Ảnh vượt quá giới hạn 10 MB.');
+  }
+
+  const bytes = await response.arrayBuffer();
+
+  if (bytes.byteLength > MAX_ATTACHMENT_SIZE) {
+    throw new Error('Ảnh vượt quá giới hạn 10 MB.');
+  }
+
+  return {
+    bytes,
+    contentType: response.headers.get('content-type') || 'image/jpeg',
+  };
+}
 
 function getCommandArgument(text: string) {
   return text.trim().split(/\s+/).slice(1).join(' ').trim();
@@ -277,6 +350,13 @@ bot.action(/^expense:(confirm|cancel):([a-f0-9]+)$/, async (ctx) => {
       total_amount: pending.amount,
       expense_date: pending.expenseDate,
     });
+    const attachmentToken = randomBytes(8).toString('hex');
+    attachmentOffers.set(attachmentToken, {
+      expenseId: expense.id,
+      chatId: pending.chatId,
+      telegramUserId: pending.telegramUserId,
+      expiresAt: Date.now() + ATTACHMENT_TTL_MS,
+    });
     await ctx.editMessageText(
       [
         'Đã lưu khoản chi.',
@@ -284,10 +364,103 @@ bot.action(/^expense:(confirm|cancel):([a-f0-9]+)$/, async (ctx) => {
         `Nội dung: ${expense.title}`,
         `Số tiền: ${formatMoney(Number(expense.total_amount), expense.currency)}`,
         'Cách chia: Chia đều',
-      ].join('\n')
+        '',
+        'Bạn có muốn thêm ảnh hóa đơn?',
+      ].join('\n'),
+      Markup.inlineKeyboard([
+        Markup.button.callback(
+          'Thêm ảnh',
+          `attachment:add:${attachmentToken}`
+        ),
+        Markup.button.callback(
+          'Bỏ qua',
+          `attachment:skip:${attachmentToken}`
+        ),
+      ])
     );
   } catch (error) {
     await ctx.editMessageText(`Không thể lưu khoản chi.\n${friendlyError(error)}`);
+  }
+});
+
+bot.action(/^attachment:(add|skip):([a-f0-9]+)$/, async (ctx) => {
+  const action = ctx.match[1];
+  const token = ctx.match[2];
+  const offer = attachmentOffers.get(token);
+  const chatId = String(ctx.chat?.id);
+  const telegramUserId = String(ctx.from.id);
+
+  if (!offer || !isOwnedAttachmentState(offer, chatId, telegramUserId)) {
+    attachmentOffers.delete(token);
+    await ctx.answerCbQuery(
+      'Yêu cầu đã hết hạn hoặc không thuộc về bạn.'
+    );
+    return;
+  }
+
+  attachmentOffers.delete(token);
+  await ctx.editMessageReplyMarkup(undefined).catch(() => undefined);
+
+  if (action === 'skip') {
+    await ctx.answerCbQuery('Đã bỏ qua');
+    return;
+  }
+
+  pendingAttachments.set(attachmentKey(chatId, telegramUserId), {
+    ...offer,
+    expiresAt: Date.now() + ATTACHMENT_TTL_MS,
+  });
+  await ctx.answerCbQuery('Đang chờ ảnh');
+  await ctx.reply(
+    'Hãy gửi ảnh hóa đơn trong 5 phút. Ảnh tiếp theo của bạn trong nhóm này sẽ được gắn vào khoản chi.'
+  );
+});
+
+bot.on('photo', async (ctx) => {
+  const chatId = String(ctx.chat.id);
+  const telegramUserId = String(ctx.from.id);
+  const key = attachmentKey(chatId, telegramUserId);
+  const pending = pendingAttachments.get(key);
+
+  if (!pending) return;
+
+  if (pending.expiresAt <= Date.now()) {
+    pendingAttachments.delete(key);
+    await ctx.reply(
+      'Yêu cầu thêm ảnh đã hết hạn. Khoản chi vẫn được lưu mà không có ảnh.'
+    );
+    return;
+  }
+
+  const photo = ctx.message.photo.at(-1);
+
+  if (!photo) return;
+
+  try {
+    const fileUrl = await ctx.telegram.getFileLink(photo.file_id);
+    const downloaded = await downloadTelegramPhoto(fileUrl);
+    await tinoApi.uploadExpenseAttachment(pending.expenseId, {
+      telegram_user_id: telegramUserId,
+      telegram_chat_id: chatId,
+      bytes: downloaded.bytes,
+      file_name: `telegram-${photo.file_unique_id}.jpg`,
+      content_type: downloaded.contentType.startsWith('image/')
+        ? downloaded.contentType
+        : 'image/jpeg',
+    });
+
+    pendingAttachments.delete(key);
+    await ctx.reply('Đã thêm ảnh hóa đơn vào khoản chi.');
+  } catch (error) {
+    const message =
+      error instanceof TinoApiError
+        ? friendlyError(error)
+        : error instanceof Error
+          ? error.message
+          : 'Có lỗi xảy ra khi tải ảnh.';
+    await ctx.reply(
+      `Không thể thêm ảnh hóa đơn.\n${message}\nBạn có thể gửi lại ảnh trước khi yêu cầu hết hạn.`
+    );
   }
 });
 
@@ -322,6 +495,7 @@ void bot
 
 function shutdown(signal: 'SIGINT' | 'SIGTERM') {
   botReady = false;
+  clearInterval(pendingCleanupTimer);
   bot.stop(signal);
   server.close();
 }
