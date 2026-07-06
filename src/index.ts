@@ -156,6 +156,16 @@ function currentDate() {
   }).format(new Date());
 }
 
+function currentMonth() {
+  const [year, month] = currentDate().split('-');
+  return `${year}-${month}`;
+}
+
+function formatMonthLabel(month: string) {
+  const [year, monthNumber] = month.split('-');
+  return `${monthNumber}/${year}`;
+}
+
 function friendlyError(error: unknown) {
   if (!(error instanceof TinoApiError)) {
     return 'Có lỗi xảy ra. Vui lòng thử lại.';
@@ -258,15 +268,51 @@ bot.command('connect', async (ctx) => {
 
 bot.command('wallet', async (ctx) => {
   try {
-    const context = await tinoApi.getContext(
-      String(ctx.from.id),
-      String(ctx.chat.id)
+    const telegramUserId = String(ctx.from.id);
+    const telegramChatId = String(ctx.chat.id);
+    const month = currentMonth();
+    const [context, summary] = await Promise.all([
+      tinoApi.getContext(telegramUserId, telegramChatId),
+      tinoApi.getSummary(telegramUserId, telegramChatId, month),
+    ]);
+    const memberNameById = new Map(
+      context.members.map((member) => [member.user_id, member.display_name])
     );
+    const getMemberName = (userId: string) => memberNameById.get(userId) || userId;
+    const memberLines =
+      summary.member_balances.length > 0
+        ? summary.member_balances.map((member) =>
+            [
+              `- ${getMemberName(member.user_id)}`,
+              `đã trả ${formatMoney(Number(member.paid), summary.currency)}`,
+              `phải chịu ${formatMoney(Number(member.share), summary.currency)}`,
+              `cân bằng ${formatMoney(Number(member.balance), summary.currency)}`,
+            ].join(' | ')
+          )
+        : ['Chưa có dữ liệu thành viên.'];
+    const settlementLines =
+      summary.settlements.length > 0
+        ? summary.settlements.map(
+            (settlement) =>
+              `- ${getMemberName(settlement.from_user_id)} trả ${getMemberName(
+                settlement.to_user_id
+              )}: ${formatMoney(Number(settlement.amount), settlement.currency)}`
+          )
+        : ['Không cần quyết toán.'];
+
     await ctx.reply(
       [
         `Ví: ${context.wallet.name}`,
+        `Tháng: ${formatMonthLabel(month)}`,
         `Tiền tệ: ${context.wallet.currency}`,
         `Thành viên: ${context.members.length}`,
+        `Tổng chi tiêu: ${formatMoney(Number(summary.total_amount), summary.currency)}`,
+        '',
+        'Chi tiết thành viên:',
+        ...memberLines,
+        '',
+        'Quyết toán:',
+        ...settlementLines,
       ].join('\n')
     );
   } catch (error) {

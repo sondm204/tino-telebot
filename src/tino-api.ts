@@ -34,6 +34,26 @@ type TelegramContext = {
   members: Array<{ user_id: string; display_name: string }>;
 };
 
+type WalletSummary = {
+  wallet: Wallet;
+  period_start: string;
+  period_end: string;
+  total_amount: number;
+  currency: string;
+  member_balances: Array<{
+    user_id: string;
+    paid: number;
+    share: number;
+    balance: number;
+  }>;
+  settlements: Array<{
+    from_user_id: string;
+    to_user_id: string;
+    amount: number;
+    currency: string;
+  }>;
+};
+
 type Expense = {
   id: string;
   title: string;
@@ -140,6 +160,14 @@ export const tinoApi = {
     return post<TelegramContext>('/bot/telegram/context', {
       telegram_user_id: telegramUserId,
       telegram_chat_id: telegramChatId,
+    });
+  },
+
+  getSummary(telegramUserId: string, telegramChatId: string, month: string) {
+    return post<WalletSummary>('/bot/telegram/summary', {
+      telegram_user_id: telegramUserId,
+      telegram_chat_id: telegramChatId,
+      month,
     });
   },
 
