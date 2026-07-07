@@ -156,6 +156,16 @@ export const tinoApi = {
     });
   },
 
+  disconnectChat(telegramUserId: string, telegramChatId: string) {
+    return post<{ telegram_chat_id: string; wallet: Wallet }>(
+      '/bot/telegram/disconnect',
+      {
+        telegram_user_id: telegramUserId,
+        telegram_chat_id: telegramChatId,
+      }
+    );
+  },
+
   getContext(telegramUserId: string, telegramChatId: string) {
     return post<TelegramContext>('/bot/telegram/context', {
       telegram_user_id: telegramUserId,

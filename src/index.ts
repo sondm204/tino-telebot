@@ -1,14 +1,12 @@
-import { randomBytes } from 'node:crypto';
 import { createServer } from 'node:http';
-import { Markup, Telegraf } from 'telegraf';
+import { Telegraf } from 'telegraf';
 import type { Context } from 'telegraf';
 import { config } from './config.js';
 import { parseExpenseMessage } from './expense-parser.js';
 import { tinoApi, TinoApiError } from './tino-api.js';
 
 const bot = new Telegraf(config.botToken);
-const PENDING_TTL_MS = 5 * 60_000;
-const ATTACHMENT_TTL_MS = 5 * 60_000;
+const EXPENSE_PHOTO_WAIT_MS = 60_000;
 const MAX_ATTACHMENT_SIZE = 10 * 1024 * 1024;
 const port = Number(process.env.PORT || 4040);
 let botReady = false;
@@ -36,59 +34,41 @@ const server = createServer((request, response) => {
   );
 });
 
+type PendingExpenseAttachment = {
+  bytes: ArrayBuffer;
+  contentType: string;
+  fileName: string;
+};
+
 type PendingExpense = {
   chatId: string;
   telegramUserId: string;
   title: string;
   amount: number;
+  currency: string;
+  walletName: string;
   expenseDate: string;
   expiresAt: number;
+  timer: NodeJS.Timeout;
+  attachment?: PendingExpenseAttachment;
+  saving?: boolean;
 };
-
-type AttachmentOffer = {
-  expenseId: string;
-  chatId: string;
-  telegramUserId: string;
-  expiresAt: number;
-};
-
-type PendingAttachment = AttachmentOffer;
 
 const pendingExpenses = new Map<string, PendingExpense>();
-const attachmentOffers = new Map<string, AttachmentOffer>();
-const pendingAttachments = new Map<string, PendingAttachment>();
+
 const pendingCleanupTimer = setInterval(() => {
   const now = Date.now();
 
-  for (const [token, pending] of pendingExpenses) {
-    if (pending.expiresAt <= now) pendingExpenses.delete(token);
+  for (const [key, pending] of pendingExpenses) {
+    if (!pending.saving && pending.expiresAt <= now) {
+      void finalizePendingExpense(key);
+    }
   }
-
-  for (const [token, offer] of attachmentOffers) {
-    if (offer.expiresAt <= now) attachmentOffers.delete(token);
-  }
-
-  for (const [key, pending] of pendingAttachments) {
-    if (pending.expiresAt <= now) pendingAttachments.delete(key);
-  }
-}, 60_000);
+}, 30_000);
 pendingCleanupTimer.unref();
 
-function attachmentKey(chatId: string, telegramUserId: string) {
+function pendingExpenseKey(chatId: string, telegramUserId: string) {
   return `${chatId}:${telegramUserId}`;
-}
-
-function isOwnedAttachmentState(
-  state: AttachmentOffer | undefined,
-  chatId: string,
-  telegramUserId: string
-) {
-  return (
-    state &&
-    state.expiresAt > Date.now() &&
-    state.chatId === chatId &&
-    state.telegramUserId === telegramUserId
-  );
 }
 
 async function downloadTelegramPhoto(fileUrl: URL) {
@@ -176,8 +156,14 @@ function friendlyError(error: unknown) {
       'Telegram chưa liên kết. Hãy tạo mã trong Tino rồi gửi /link MA.',
     TELEGRAM_CHAT_NOT_CONNECTED:
       'Nhóm chưa kết nối với ví Tino. Owner hãy dùng /connect MA.',
+    TELEGRAM_CHAT_DISCONNECT_FAILED:
+      'Không thể hủy kết nối nhóm khỏi ví. Vui lòng thử lại.',
+    TELEGRAM_CONNECT_DENIED:
+      'Mã kết nối không thuộc tài khoản Tino của bạn.',
     WALLET_ACCESS_DENIED:
       'Tài khoản của bạn không còn là thành viên hoạt động trong ví.',
+    WALLET_OWNER_REQUIRED:
+      'Chỉ owner của ví mới thực hiện được thao tác này.',
     INVALID_TELEGRAM_CODE: 'Mã không hợp lệ, đã dùng hoặc đã hết hạn.',
     TELEGRAM_ACCOUNT_ALREADY_LINKED:
       'Tài khoản Telegram hoặc Tino này đã được liên kết.',
@@ -193,6 +179,79 @@ async function isTelegramAdmin(ctx: Context) {
   if (!ctx.chat || !ctx.from || ctx.chat.type === 'private') return false;
   const member = await ctx.telegram.getChatMember(ctx.chat.id, ctx.from.id);
   return member.status === 'creator' || member.status === 'administrator';
+}
+
+async function sendBotMessage(chatId: string, message: string) {
+  try {
+    await bot.telegram.sendMessage(chatId, message);
+  } catch (error) {
+    console.error('Could not send Telegram message', error);
+  }
+}
+
+async function finalizePendingExpense(key: string) {
+  const pending = pendingExpenses.get(key);
+
+  if (!pending || pending.saving) return;
+
+  pending.saving = true;
+  clearTimeout(pending.timer);
+
+  try {
+    const expense = await tinoApi.createExpense({
+      telegram_user_id: pending.telegramUserId,
+      telegram_chat_id: pending.chatId,
+      title: pending.title,
+      total_amount: pending.amount,
+      expense_date: pending.expenseDate,
+    });
+    let attachmentSaved = false;
+    let attachmentError: unknown = null;
+
+    if (pending.attachment) {
+      try {
+        await tinoApi.uploadExpenseAttachment(expense.id, {
+          telegram_user_id: pending.telegramUserId,
+          telegram_chat_id: pending.chatId,
+          bytes: pending.attachment.bytes,
+          file_name: pending.attachment.fileName,
+          content_type: pending.attachment.contentType,
+        });
+        attachmentSaved = true;
+      } catch (error) {
+        attachmentError = error;
+      }
+    }
+
+    await sendBotMessage(
+      pending.chatId,
+      [
+        pending.attachment && attachmentSaved
+          ? 'Đã lưu khoản chi kèm ảnh.'
+          : 'Đã lưu khoản chi.',
+        `Ví: ${expense.wallet_name || pending.walletName}`,
+        `Nội dung: ${expense.title}`,
+        `Số tiền: ${formatMoney(Number(expense.total_amount), expense.currency)}`,
+        'Cách chia: Chia đều',
+        attachmentError
+          ? `Ảnh chưa upload được: ${
+              attachmentError instanceof Error
+                ? attachmentError.message
+                : 'Có lỗi xảy ra.'
+            }`
+          : null,
+      ]
+        .filter(Boolean)
+        .join('\n')
+    );
+  } catch (error) {
+    await sendBotMessage(
+      pending.chatId,
+      `Không thể lưu khoản chi "${pending.title}".\n${friendlyError(error)}`
+    );
+  } finally {
+    pendingExpenses.delete(key);
+  }
 }
 
 bot.start((ctx) =>
@@ -215,6 +274,7 @@ bot.help((ctx) =>
       'Các lệnh:',
       '/link MA - liên kết Telegram với tài khoản Tino',
       '/connect MA - kết nối nhóm hiện tại với một ví',
+      '/disconnect - hủy kết nối nhóm hiện tại khỏi ví',
       '/wallet - xem ví đang kết nối',
       '/help - xem hướng dẫn',
       '',
@@ -223,7 +283,7 @@ bot.help((ctx) =>
       'tiền điện 1.2tr',
       'ăn sáng 35.000',
       '',
-      'Người gửi là người trả, khoản chi mặc định chia đều.',
+      'Sau khi gửi chi tiêu, bot sẽ chờ 1 phút để bạn gửi ảnh hóa đơn. Nếu không có ảnh, khoản chi vẫn được tự lưu.',
     ].join('\n')
   )
 );
@@ -261,6 +321,23 @@ bot.command('connect', async (ctx) => {
       telegram_chat_title: chatTitle(ctx),
     });
     await ctx.reply(`Đã kết nối nhóm với ví "${result.wallet.name}".`);
+  } catch (error) {
+    await ctx.reply(friendlyError(error));
+  }
+});
+
+bot.command('disconnect', async (ctx) => {
+  if (ctx.chat.type === 'private') {
+    await ctx.reply('Lệnh /disconnect cần được gửi trong group hoặc supergroup.');
+    return;
+  }
+
+  try {
+    const result = await tinoApi.disconnectChat(
+      String(ctx.from.id),
+      String(ctx.chat.id)
+    );
+    await ctx.reply(`Đã hủy kết nối nhóm khỏi ví "${result.wallet.name}".`);
   } catch (error) {
     await ctx.reply(friendlyError(error));
   }
@@ -330,151 +407,59 @@ bot.on('text', async (ctx) => {
   const parsed = parseExpenseMessage(ctx.message.text);
   if (!parsed) return;
 
+  const chatId = String(ctx.chat.id);
+  const telegramUserId = String(ctx.from.id);
+  const key = pendingExpenseKey(chatId, telegramUserId);
+
   try {
-    const context = await tinoApi.getContext(
-      String(ctx.from.id),
-      String(ctx.chat.id)
-    );
-    const token = randomBytes(8).toString('hex');
-    pendingExpenses.set(token, {
-      chatId: String(ctx.chat.id),
-      telegramUserId: String(ctx.from.id),
+    if (pendingExpenses.has(key)) {
+      await finalizePendingExpense(key);
+    }
+
+    const context = await tinoApi.getContext(telegramUserId, chatId);
+    const timer = setTimeout(() => {
+      void finalizePendingExpense(key);
+    }, EXPENSE_PHOTO_WAIT_MS);
+    timer.unref();
+
+    pendingExpenses.set(key, {
+      chatId,
+      telegramUserId,
       title: parsed.title,
       amount: parsed.amount,
+      currency: context.wallet.currency,
+      walletName: context.wallet.name,
       expenseDate: currentDate(),
-      expiresAt: Date.now() + PENDING_TTL_MS,
+      expiresAt: Date.now() + EXPENSE_PHOTO_WAIT_MS,
+      timer,
     });
 
     await ctx.reply(
       [
-        'Xác nhận khoản chi?',
+        'Đã nhận khoản chi.',
         `Ví: ${context.wallet.name}`,
         `Nội dung: ${parsed.title}`,
         `Số tiền: ${formatMoney(parsed.amount, context.wallet.currency)}`,
         'Cách chia: Chia đều',
-      ].join('\n'),
-      Markup.inlineKeyboard([
-        Markup.button.callback('Xác nhận', `expense:confirm:${token}`),
-        Markup.button.callback('Hủy', `expense:cancel:${token}`),
-      ])
+        '',
+        'Nếu có ảnh hóa đơn, hãy gửi ảnh trong 1 phút. Nếu không, mình sẽ tự lưu khoản chi không kèm ảnh.',
+      ].join('\n')
     );
   } catch (error) {
     await ctx.reply(friendlyError(error));
   }
 });
 
-bot.action(/^expense:(confirm|cancel):([a-f0-9]+)$/, async (ctx) => {
-  const action = ctx.match[1];
-  const token = ctx.match[2];
-  const pending = pendingExpenses.get(token);
-
-  if (
-    !pending ||
-    pending.expiresAt <= Date.now() ||
-    pending.telegramUserId !== String(ctx.from.id) ||
-    pending.chatId !== String(ctx.chat?.id)
-  ) {
-    pendingExpenses.delete(token);
-    await ctx.answerCbQuery('Yêu cầu đã hết hạn hoặc không thuộc về bạn.');
-    return;
-  }
-
-  pendingExpenses.delete(token);
-
-  if (action === 'cancel') {
-    await ctx.answerCbQuery('Đã hủy');
-    await ctx.editMessageText('Đã hủy khoản chi.');
-    return;
-  }
-
-  try {
-    await ctx.answerCbQuery('Đang lưu...');
-    const expense = await tinoApi.createExpense({
-      telegram_user_id: pending.telegramUserId,
-      telegram_chat_id: pending.chatId,
-      title: pending.title,
-      total_amount: pending.amount,
-      expense_date: pending.expenseDate,
-    });
-    const attachmentToken = randomBytes(8).toString('hex');
-    attachmentOffers.set(attachmentToken, {
-      expenseId: expense.id,
-      chatId: pending.chatId,
-      telegramUserId: pending.telegramUserId,
-      expiresAt: Date.now() + ATTACHMENT_TTL_MS,
-    });
-    await ctx.editMessageText(
-      [
-        'Đã lưu khoản chi.',
-        `Ví: ${expense.wallet_name}`,
-        `Nội dung: ${expense.title}`,
-        `Số tiền: ${formatMoney(Number(expense.total_amount), expense.currency)}`,
-        'Cách chia: Chia đều',
-        '',
-        'Bạn có muốn thêm ảnh hóa đơn?',
-      ].join('\n'),
-      Markup.inlineKeyboard([
-        Markup.button.callback(
-          'Thêm ảnh',
-          `attachment:add:${attachmentToken}`
-        ),
-        Markup.button.callback(
-          'Bỏ qua',
-          `attachment:skip:${attachmentToken}`
-        ),
-      ])
-    );
-  } catch (error) {
-    await ctx.editMessageText(`Không thể lưu khoản chi.\n${friendlyError(error)}`);
-  }
-});
-
-bot.action(/^attachment:(add|skip):([a-f0-9]+)$/, async (ctx) => {
-  const action = ctx.match[1];
-  const token = ctx.match[2];
-  const offer = attachmentOffers.get(token);
-  const chatId = String(ctx.chat?.id);
-  const telegramUserId = String(ctx.from.id);
-
-  if (!offer || !isOwnedAttachmentState(offer, chatId, telegramUserId)) {
-    attachmentOffers.delete(token);
-    await ctx.answerCbQuery(
-      'Yêu cầu đã hết hạn hoặc không thuộc về bạn.'
-    );
-    return;
-  }
-
-  attachmentOffers.delete(token);
-  await ctx.editMessageReplyMarkup(undefined).catch(() => undefined);
-
-  if (action === 'skip') {
-    await ctx.answerCbQuery('Đã bỏ qua');
-    return;
-  }
-
-  pendingAttachments.set(attachmentKey(chatId, telegramUserId), {
-    ...offer,
-    expiresAt: Date.now() + ATTACHMENT_TTL_MS,
-  });
-  await ctx.answerCbQuery('Đang chờ ảnh');
-  await ctx.reply(
-    'Hãy gửi ảnh hóa đơn trong 5 phút. Ảnh tiếp theo của bạn trong nhóm này sẽ được gắn vào khoản chi.'
-  );
-});
-
 bot.on('photo', async (ctx) => {
   const chatId = String(ctx.chat.id);
   const telegramUserId = String(ctx.from.id);
-  const key = attachmentKey(chatId, telegramUserId);
-  const pending = pendingAttachments.get(key);
+  const key = pendingExpenseKey(chatId, telegramUserId);
+  const pending = pendingExpenses.get(key);
 
-  if (!pending) return;
+  if (!pending || pending.saving) return;
 
   if (pending.expiresAt <= Date.now()) {
-    pendingAttachments.delete(key);
-    await ctx.reply(
-      'Yêu cầu thêm ảnh đã hết hạn. Khoản chi vẫn được lưu mà không có ảnh.'
-    );
+    await finalizePendingExpense(key);
     return;
   }
 
@@ -485,28 +470,22 @@ bot.on('photo', async (ctx) => {
   try {
     const fileUrl = await ctx.telegram.getFileLink(photo.file_id);
     const downloaded = await downloadTelegramPhoto(fileUrl);
-    await tinoApi.uploadExpenseAttachment(pending.expenseId, {
-      telegram_user_id: telegramUserId,
-      telegram_chat_id: chatId,
+    pending.attachment = {
       bytes: downloaded.bytes,
-      file_name: `telegram-${photo.file_unique_id}.jpg`,
-      content_type: downloaded.contentType.startsWith('image/')
+      contentType: downloaded.contentType.startsWith('image/')
         ? downloaded.contentType
         : 'image/jpeg',
-    });
-
-    pendingAttachments.delete(key);
-    await ctx.reply('Đã thêm ảnh hóa đơn vào khoản chi.');
+      fileName: `telegram-${photo.file_unique_id}.jpg`,
+    };
+    await ctx.reply('Đã nhận ảnh, mình đang lưu khoản chi.');
+    await finalizePendingExpense(key);
   } catch (error) {
     const message =
-      error instanceof TinoApiError
-        ? friendlyError(error)
-        : error instanceof Error
-          ? error.message
-          : 'Có lỗi xảy ra khi tải ảnh.';
+      error instanceof Error ? error.message : 'Có lỗi xảy ra khi tải ảnh.';
     await ctx.reply(
-      `Không thể thêm ảnh hóa đơn.\n${message}\nBạn có thể gửi lại ảnh trước khi yêu cầu hết hạn.`
+      `Không thể đọc ảnh hóa đơn: ${message}\nMình sẽ lưu khoản chi không kèm ảnh.`
     );
+    await finalizePendingExpense(key);
   }
 });
 
@@ -525,6 +504,7 @@ await new Promise<void>((resolve, reject) => {
 await bot.telegram.setMyCommands([
   { command: 'link', description: 'Liên kết tài khoản Tino' },
   { command: 'connect', description: 'Kết nối nhóm với ví' },
+  { command: 'disconnect', description: 'Hủy kết nối nhóm khỏi ví' },
   { command: 'wallet', description: 'Xem ví đang kết nối' },
   { command: 'help', description: 'Xem hướng dẫn' },
 ]);
@@ -542,6 +522,11 @@ void bot
 function shutdown(signal: 'SIGINT' | 'SIGTERM') {
   botReady = false;
   clearInterval(pendingCleanupTimer);
+
+  for (const pending of pendingExpenses.values()) {
+    clearTimeout(pending.timer);
+  }
+
   bot.stop(signal);
   server.close();
 }
