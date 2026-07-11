@@ -146,6 +146,47 @@ function formatMonthLabel(month: string) {
   return `${monthNumber}/${year}`;
 }
 
+function escapeHtml(value: unknown) {
+  return String(value)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+function truncateCell(value: string, maxLength = 18) {
+  return value.length > maxLength ? `${value.slice(0, maxLength - 1)}…` : value;
+}
+
+function formatTable(headers: string[], rows: string[][]) {
+  const normalizedRows = rows.map((row) =>
+    row.map((cell) => truncateCell(String(cell)))
+  );
+  const widths = headers.map((header, index) =>
+    Math.max(
+      header.length,
+      ...normalizedRows.map((row) => row[index]?.length ?? 0)
+    )
+  );
+  const formatRow = (row: string[]) =>
+    row.map((cell, index) => cell.padEnd(widths[index], ' ')).join('  ');
+
+  return [
+    formatRow(headers),
+    formatRow(headers.map((header, index) => '-'.repeat(widths[index]))),
+    ...normalizedRows.map(formatRow),
+  ].join('\n');
+}
+
+function htmlTable(headers: string[], rows: string[][]) {
+  if (rows.length === 0) return '';
+  return `<pre>${escapeHtml(formatTable(headers, rows))}</pre>`;
+}
+
+function htmlField(label: string, value: unknown) {
+  return `<b>${escapeHtml(label)}:</b> ${escapeHtml(value)}`;
+}
+
 function friendlyError(error: unknown) {
   if (!(error instanceof TinoApiError)) {
     return 'Có lỗi xảy ra. Vui lòng thử lại.';
@@ -189,6 +230,14 @@ async function sendBotMessage(chatId: string, message: string) {
   }
 }
 
+async function sendBotHtmlMessage(chatId: string, message: string) {
+  try {
+    await bot.telegram.sendMessage(chatId, message, { parse_mode: 'HTML' });
+  } catch (error) {
+    console.error('Could not send Telegram message', error);
+  }
+}
+
 async function finalizePendingExpense(key: string) {
   const pending = pendingExpenses.get(key);
 
@@ -223,37 +272,86 @@ async function finalizePendingExpense(key: string) {
       }
     }
 
-    await sendBotMessage(
+    await sendBotHtmlMessage(
       pending.chatId,
       [
         pending.attachment && attachmentSaved
-          ? 'Đã lưu khoản chi kèm ảnh.'
-          : 'Đã lưu khoản chi.',
-        `Ví: ${expense.wallet_name || pending.walletName}`,
-        `Nội dung: ${expense.title}`,
-        `Số tiền: ${formatMoney(Number(expense.total_amount), expense.currency)}`,
-        'Cách chia: Chia đều',
+          ? '<b>Đã lưu khoản chi kèm ảnh</b>'
+          : '<b>Đã lưu khoản chi</b>',
+        htmlField('Ví', expense.wallet_name || pending.walletName),
+        htmlField('Nội dung', expense.title),
+        htmlField(
+          'Số tiền',
+          formatMoney(Number(expense.total_amount), expense.currency)
+        ),
+        htmlField('Cách chia', 'Chia đều'),
         attachmentError
-          ? `Ảnh chưa upload được: ${
+          ? htmlField(
+              'Ảnh chưa upload được',
               attachmentError instanceof Error
                 ? attachmentError.message
                 : 'Có lỗi xảy ra.'
-            }`
+            )
           : null,
       ]
         .filter(Boolean)
         .join('\n')
     );
   } catch (error) {
-    await sendBotMessage(
+    await sendBotHtmlMessage(
       pending.chatId,
-      `Không thể lưu khoản chi "${pending.title}".\n${friendlyError(error)}`
+      [
+        '<b>Không thể lưu khoản chi</b>',
+        htmlField('Nội dung', pending.title),
+        htmlField('Lý do', friendlyError(error)),
+      ].join('\n')
     );
   } finally {
     pendingExpenses.delete(key);
   }
 }
+async function replyPersonalSummary(ctx: Context) {
+  if (!ctx.from) {
+    await ctx.reply('Không xác định được người gửi.');
+    return;
+  }
 
+  try {
+    const month = currentMonth();
+    const summary = await tinoApi.getPersonalSummary(String(ctx.from.id), month);
+    const totalRows = summary.totals_by_currency.map((total) => [
+      total.currency,
+      formatMoney(Number(total.total_amount), total.currency),
+      formatMoney(Number(total.paid_amount), total.currency),
+      formatMoney(Number(total.share_amount), total.currency),
+    ]);
+    const walletRows = summary.wallets.map((wallet) => [
+      wallet.wallet_name,
+      formatMoney(Number(wallet.total_amount), wallet.currency),
+      formatMoney(Number(wallet.paid_amount), wallet.currency),
+      formatMoney(Number(wallet.share_amount), wallet.currency),
+    ]);
+
+    await ctx.reply(
+      [
+        `<b>Tổng kết cá nhân tháng ${escapeHtml(formatMonthLabel(month))}</b>`,
+        '',
+        '<b>Tổng theo tiền tệ</b>',
+        totalRows.length > 0
+          ? htmlTable(['Tiền', 'Tổng ví', 'Đã trả', 'Phải chịu'], totalRows)
+          : '<i>Chưa có chi tiêu trong tháng này.</i>',
+        '',
+        '<b>Theo từng ví</b>',
+        walletRows.length > 0
+          ? htmlTable(['Ví', 'Tổng', 'Đã trả', 'Phải chịu'], walletRows)
+          : '<i>Bạn chưa thuộc ví nào.</i>',
+      ].join('\n'),
+      { parse_mode: 'HTML' }
+    );
+  } catch (error) {
+    await ctx.reply(friendlyError(error));
+  }
+}
 bot.start((ctx) =>
   ctx.reply(
     [
@@ -356,45 +454,66 @@ bot.command('wallet', async (ctx) => {
       context.members.map((member) => [member.user_id, member.display_name])
     );
     const getMemberName = (userId: string) => memberNameById.get(userId) || userId;
-    const memberLines =
-      summary.member_balances.length > 0
-        ? summary.member_balances.map((member) =>
-            [
-              `- ${getMemberName(member.user_id)}`,
-              `đã trả ${formatMoney(Number(member.paid), summary.currency)}`,
-              `phải chịu ${formatMoney(Number(member.share), summary.currency)}`,
-              `cân bằng ${formatMoney(Number(member.balance), summary.currency)}`,
-            ].join(' | ')
-          )
-        : ['Chưa có dữ liệu thành viên.'];
-    const settlementLines =
-      summary.settlements.length > 0
-        ? summary.settlements.map(
-            (settlement) =>
-              `- ${getMemberName(settlement.from_user_id)} trả ${getMemberName(
-                settlement.to_user_id
-              )}: ${formatMoney(Number(settlement.amount), settlement.currency)}`
-          )
-        : ['Không cần quyết toán.'];
+    const memberRows = summary.member_balances.map((member) => [
+      getMemberName(member.user_id),
+      formatMoney(Number(member.paid), summary.currency),
+      formatMoney(Number(member.share), summary.currency),
+      formatMoney(Number(member.balance), summary.currency),
+    ]);
+    const settlementRows = summary.settlements.map((settlement) => [
+      getMemberName(settlement.from_user_id),
+      getMemberName(settlement.to_user_id),
+      formatMoney(Number(settlement.amount), settlement.currency),
+    ]);
 
     await ctx.reply(
       [
-        `Ví: ${context.wallet.name}`,
-        `Tháng: ${formatMonthLabel(month)}`,
-        `Tiền tệ: ${context.wallet.currency}`,
-        `Thành viên: ${context.members.length}`,
-        `Tổng chi tiêu: ${formatMoney(Number(summary.total_amount), summary.currency)}`,
+        `<b>${escapeHtml(context.wallet.name)}</b>`,
+        htmlField('Tháng', formatMonthLabel(month)),
+        htmlField('Tiền tệ', context.wallet.currency),
+        htmlField('Thành viên', context.members.length),
+        htmlField('Tổng chi tiêu', formatMoney(Number(summary.total_amount), summary.currency)),
         '',
-        'Chi tiết thành viên:',
-        ...memberLines,
+        '<b>Chi tiết thành viên</b>',
+        memberRows.length > 0
+          ? htmlTable(['Tên', 'Đã trả', 'Phải chịu', 'Cân bằng'], memberRows)
+          : '<i>Chưa có dữ liệu thành viên.</i>',
         '',
-        'Quyết toán:',
-        ...settlementLines,
-      ].join('\n')
+        '<b>Quyết toán</b>',
+        settlementRows.length > 0
+          ? htmlTable(['Từ', 'Đến', 'Số tiền'], settlementRows)
+          : '<i>Không cần quyết toán.</i>',
+      ].join('\n'),
+      { parse_mode: 'HTML' }
     );
   } catch (error) {
     await ctx.reply(friendlyError(error));
   }
+});
+bot.command(['me', 'summary'], replyPersonalSummary);
+
+bot.action(/^expense:skip-photo:(.+)$/, async (ctx) => {
+  const key = ctx.match[1];
+  const pending = pendingExpenses.get(key);
+
+  if (!pending) {
+    await ctx.answerCbQuery('Yêu cầu đã hết hạn hoặc đã được lưu.');
+    return;
+  }
+
+  if (pending.telegramUserId !== String(ctx.from.id)) {
+    await ctx.answerCbQuery('Chỉ người tạo khoản chi mới dùng được nút này.');
+    return;
+  }
+
+  if (pending.saving) {
+    await ctx.answerCbQuery('Khoản chi đang được lưu.');
+    return;
+  }
+
+  await ctx.answerCbQuery('Đang lưu khoản chi không kèm ảnh.');
+  await ctx.editMessageReplyMarkup(undefined).catch(() => undefined);
+  await finalizePendingExpense(key);
 });
 
 bot.on('text', async (ctx) => {
@@ -436,14 +555,27 @@ bot.on('text', async (ctx) => {
 
     await ctx.reply(
       [
-        'Đã nhận khoản chi.',
-        `Ví: ${context.wallet.name}`,
-        `Nội dung: ${parsed.title}`,
-        `Số tiền: ${formatMoney(parsed.amount, context.wallet.currency)}`,
-        'Cách chia: Chia đều',
+        '<b>Đã nhận khoản chi</b>',
+        htmlField('Ví', context.wallet.name),
+        htmlField('Nội dung', parsed.title),
+        htmlField('Số tiền', formatMoney(parsed.amount, context.wallet.currency)),
+        htmlField('Cách chia', 'Chia đều'),
         '',
-        'Nếu có ảnh hóa đơn, hãy gửi ảnh trong 1 phút. Nếu không, mình sẽ tự lưu khoản chi không kèm ảnh.',
-      ].join('\n')
+        '<i>Nếu có ảnh hóa đơn, hãy gửi ảnh trong 1 phút. Nếu không, bấm "Bỏ qua ảnh" để lưu ngay.</i>',
+      ].join('\n'),
+      {
+        parse_mode: 'HTML',
+        reply_markup: {
+          inline_keyboard: [
+            [
+              {
+                text: 'Bỏ qua ảnh',
+                callback_data: `expense:skip-photo:${key}`,
+              },
+            ],
+          ],
+        },
+      }
     );
   } catch (error) {
     await ctx.reply(friendlyError(error));
@@ -502,6 +634,8 @@ await new Promise<void>((resolve, reject) => {
 });
 
 await bot.telegram.setMyCommands([
+  { command: 'me', description: 'Tổng kết chi tiêu cá nhân tháng này' },
+  { command: 'summary', description: 'Tổng kết chi tiêu cá nhân tháng này' },
   { command: 'link', description: 'Liên kết tài khoản Tino' },
   { command: 'connect', description: 'Kết nối nhóm với ví' },
   { command: 'disconnect', description: 'Hủy kết nối nhóm khỏi ví' },

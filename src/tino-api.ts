@@ -54,6 +54,25 @@ type WalletSummary = {
   }>;
 };
 
+type PersonalSummary = {
+  period_start: string;
+  period_end: string;
+  totals_by_currency: Array<{
+    currency: string;
+    total_amount: number;
+    paid_amount: number;
+    share_amount: number;
+  }>;
+  wallets: Array<{
+    wallet_id: string;
+    wallet_name: string;
+    currency: string;
+    total_amount: number;
+    paid_amount: number;
+    share_amount: number;
+  }>;
+};
+
 type Expense = {
   id: string;
   title: string;
@@ -177,6 +196,13 @@ export const tinoApi = {
     return post<WalletSummary>('/bot/telegram/summary', {
       telegram_user_id: telegramUserId,
       telegram_chat_id: telegramChatId,
+      month,
+    });
+  },
+
+  getPersonalSummary(telegramUserId: string, month: string) {
+    return post<PersonalSummary>('/bot/telegram/personal-summary', {
+      telegram_user_id: telegramUserId,
       month,
     });
   },
