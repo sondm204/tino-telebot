@@ -241,4 +241,34 @@ export const tinoApi = {
       form
     );
   },
+
+  uploadExpenseAttachments(
+    expenseId: string,
+    input: {
+      telegram_user_id: string;
+      telegram_chat_id: string;
+      files: Array<{
+        bytes: ArrayBuffer;
+        file_name: string;
+        content_type: string;
+      }>;
+    }
+  ) {
+    const form = new FormData();
+    form.set('telegram_user_id', input.telegram_user_id);
+    form.set('telegram_chat_id', input.telegram_chat_id);
+
+    for (const file of input.files) {
+      form.append(
+        'attachments',
+        new Blob([file.bytes], { type: file.content_type }),
+        file.file_name
+      );
+    }
+
+    return postForm<Attachment[]>(
+      `/bot/telegram/expenses/${expenseId}/attachments`,
+      form
+    );
+  },
 };

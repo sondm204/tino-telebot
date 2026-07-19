@@ -8,6 +8,7 @@ import { tinoApi, TinoApiError } from './tino-api.js';
 const bot = new Telegraf(config.botToken);
 const EXPENSE_PHOTO_WAIT_MS = 60_000;
 const MAX_ATTACHMENT_SIZE = 10 * 1024 * 1024;
+const MAX_PENDING_ATTACHMENTS = 5;
 const port = Number(process.env.PORT || 4040);
 let botReady = false;
 
@@ -50,7 +51,7 @@ type PendingExpense = {
   expenseDate: string;
   expiresAt: number;
   timer: NodeJS.Timeout;
-  attachment?: PendingExpenseAttachment;
+  attachments: PendingExpenseAttachment[];
   saving?: boolean;
 };
 
@@ -254,19 +255,21 @@ async function finalizePendingExpense(key: string) {
       total_amount: pending.amount,
       expense_date: pending.expenseDate,
     });
-    let attachmentSaved = false;
+    let attachmentSavedCount = 0;
     let attachmentError: unknown = null;
 
-    if (pending.attachment) {
+    if (pending.attachments.length > 0) {
       try {
-        await tinoApi.uploadExpenseAttachment(expense.id, {
+        const attachments = await tinoApi.uploadExpenseAttachments(expense.id, {
           telegram_user_id: pending.telegramUserId,
           telegram_chat_id: pending.chatId,
-          bytes: pending.attachment.bytes,
-          file_name: pending.attachment.fileName,
-          content_type: pending.attachment.contentType,
+          files: pending.attachments.map((attachment) => ({
+            bytes: attachment.bytes,
+            file_name: attachment.fileName,
+            content_type: attachment.contentType,
+          })),
         });
-        attachmentSaved = true;
+        attachmentSavedCount = attachments.length;
       } catch (error) {
         attachmentError = error;
       }
@@ -275,8 +278,8 @@ async function finalizePendingExpense(key: string) {
     await sendBotHtmlMessage(
       pending.chatId,
       [
-        pending.attachment && attachmentSaved
-          ? '<b>Đã lưu khoản chi kèm ảnh</b>'
+        attachmentSavedCount > 0
+          ? `<b>Đã lưu khoản chi kèm ${attachmentSavedCount} ảnh</b>`
           : '<b>Đã lưu khoản chi</b>',
         htmlField('Ví', expense.wallet_name || pending.walletName),
         htmlField('Nội dung', expense.title),
@@ -381,7 +384,7 @@ bot.help((ctx) =>
       'tiền điện 1.2tr',
       'ăn sáng 35.000',
       '',
-      'Sau khi gửi chi tiêu, bot sẽ chờ 1 phút để bạn gửi ảnh hóa đơn. Nếu không có ảnh, khoản chi vẫn được tự lưu.',
+      'Sau khi gửi chi tiêu, bot sẽ luôn chờ 1 phút để bạn gửi nhiều ảnh hóa đơn. Nếu không có ảnh, khoản chi vẫn được tự lưu.',
     ].join('\n')
   )
 );
@@ -511,7 +514,7 @@ bot.action(/^expense:skip-photo:(.+)$/, async (ctx) => {
     return;
   }
 
-  await ctx.answerCbQuery('Đang lưu khoản chi không kèm ảnh.');
+  await ctx.answerCbQuery('Đang lưu khoản chi.');
   await ctx.editMessageReplyMarkup(undefined).catch(() => undefined);
   await finalizePendingExpense(key);
 });
@@ -551,6 +554,7 @@ bot.on('text', async (ctx) => {
       expenseDate: currentDate(),
       expiresAt: Date.now() + EXPENSE_PHOTO_WAIT_MS,
       timer,
+      attachments: [],
     });
 
     await ctx.reply(
@@ -561,7 +565,7 @@ bot.on('text', async (ctx) => {
         htmlField('Số tiền', formatMoney(parsed.amount, context.wallet.currency)),
         htmlField('Cách chia', 'Chia đều'),
         '',
-        '<i>Nếu có ảnh hóa đơn, hãy gửi ảnh trong 1 phút. Nếu không, bấm "Bỏ qua ảnh" để lưu ngay.</i>',
+        `<i>Nếu có ảnh hóa đơn, hãy gửi tối đa ${MAX_PENDING_ATTACHMENTS} ảnh trong 1 phút. Bot sẽ lưu sau khi hết thời gian chờ. Nếu không, bấm "Bỏ qua ảnh" để lưu ngay.</i>`,
       ].join('\n'),
       {
         parse_mode: 'HTML',
@@ -595,6 +599,11 @@ bot.on('photo', async (ctx) => {
     return;
   }
 
+  if (pending.attachments.length >= MAX_PENDING_ATTACHMENTS) {
+    await ctx.reply(`Đã nhận tối đa ${MAX_PENDING_ATTACHMENTS} ảnh cho khoản chi này.`);
+    return;
+  }
+
   const photo = ctx.message.photo.at(-1);
 
   if (!photo) return;
@@ -602,22 +611,22 @@ bot.on('photo', async (ctx) => {
   try {
     const fileUrl = await ctx.telegram.getFileLink(photo.file_id);
     const downloaded = await downloadTelegramPhoto(fileUrl);
-    pending.attachment = {
+    pending.attachments.push({
       bytes: downloaded.bytes,
       contentType: downloaded.contentType.startsWith('image/')
         ? downloaded.contentType
         : 'image/jpeg',
       fileName: `telegram-${photo.file_unique_id}.jpg`,
-    };
-    await ctx.reply('Đã nhận ảnh, mình đang lưu khoản chi.');
-    await finalizePendingExpense(key);
+    });
+    await ctx.reply(
+      `Đã nhận ${pending.attachments.length}/${MAX_PENDING_ATTACHMENTS} ảnh. Mình sẽ lưu khoản chi sau khi hết 1 phút.`
+    );
   } catch (error) {
     const message =
       error instanceof Error ? error.message : 'Có lỗi xảy ra khi tải ảnh.';
     await ctx.reply(
-      `Không thể đọc ảnh hóa đơn: ${message}\nMình sẽ lưu khoản chi không kèm ảnh.`
+      `Không thể đọc ảnh hóa đơn: ${message}\nBạn vẫn có thể gửi ảnh khác trong thời gian chờ.`
     );
-    await finalizePendingExpense(key);
   }
 });
 
