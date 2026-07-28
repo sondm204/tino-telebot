@@ -81,6 +81,19 @@ type Expense = {
   wallet_name: string;
 };
 
+type ReceiptExpenseDraft = {
+  title: string;
+  description: string | null;
+  total_amount: number | null;
+  expense_date: string;
+  merchant_name: string | null;
+  confidence: number | null;
+  source: {
+    model_id: string;
+    api_version: string;
+  };
+};
+
 type Attachment = {
   id: string;
   file_url: string;
@@ -133,7 +146,7 @@ async function postForm<T>(path: string, body: FormData) {
         'x-tino-bot-secret': config.serviceSecret,
       },
       body,
-      signal: AbortSignal.timeout(30_000),
+      signal: AbortSignal.timeout(60_000),
     });
   } catch {
     throw new TinoApiError(
@@ -215,6 +228,28 @@ export const tinoApi = {
     expense_date: string;
   }) {
     return post<Expense>('/bot/telegram/expenses', input);
+  },
+
+  createReceiptExpenseDraft(input: {
+    telegram_user_id: string;
+    telegram_chat_id: string;
+    bytes: ArrayBuffer;
+    file_name: string;
+    content_type: string;
+  }) {
+    const form = new FormData();
+    form.set('telegram_user_id', input.telegram_user_id);
+    form.set('telegram_chat_id', input.telegram_chat_id);
+    form.set(
+      'receipt',
+      new Blob([input.bytes], { type: input.content_type }),
+      input.file_name
+    );
+
+    return postForm<ReceiptExpenseDraft>(
+      '/bot/telegram/expenses/receipt-draft',
+      form
+    );
   },
 
   uploadExpenseAttachment(

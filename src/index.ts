@@ -7,6 +7,7 @@ import { tinoApi, TinoApiError } from './tino-api.js';
 
 const bot = new Telegraf(config.botToken);
 const EXPENSE_PHOTO_WAIT_MS = 60_000;
+const RECEIPT_UPLOAD_WAIT_MS = 120_000;
 const MAX_ATTACHMENT_SIZE = 10 * 1024 * 1024;
 const MAX_PENDING_ATTACHMENTS = 5;
 const port = Number(process.env.PORT || 4040);
@@ -55,7 +56,18 @@ type PendingExpense = {
   saving?: boolean;
 };
 
+type PendingReceiptScan = {
+  chatId: string;
+  telegramUserId: string;
+  walletName: string;
+  currency: string;
+  expiresAt: number;
+  timer: NodeJS.Timeout;
+  scanning?: boolean;
+};
+
 const pendingExpenses = new Map<string, PendingExpense>();
+const pendingReceiptScans = new Map<string, PendingReceiptScan>();
 
 const pendingCleanupTimer = setInterval(() => {
   const now = Date.now();
@@ -63,6 +75,13 @@ const pendingCleanupTimer = setInterval(() => {
   for (const [key, pending] of pendingExpenses) {
     if (!pending.saving && pending.expiresAt <= now) {
       void finalizePendingExpense(key);
+    }
+  }
+
+  for (const [key, pending] of pendingReceiptScans) {
+    if (!pending.scanning && pending.expiresAt <= now) {
+      clearTimeout(pending.timer);
+      pendingReceiptScans.delete(key);
     }
   }
 }, 30_000);
@@ -313,6 +332,46 @@ async function finalizePendingExpense(key: string) {
     pendingExpenses.delete(key);
   }
 }
+
+async function createPendingExpenseFromReceipt(
+  key: string,
+  scan: PendingReceiptScan,
+  attachment: PendingExpenseAttachment,
+  draft: {
+    title: string;
+    total_amount: number | null;
+    expense_date: string;
+    merchant_name: string | null;
+    confidence: number | null;
+  }
+) {
+  if (!draft.total_amount || draft.total_amount <= 0) {
+    throw new Error('Không nhận diện được tổng tiền trong hoá đơn.');
+  }
+
+  if (pendingExpenses.has(key)) {
+    await finalizePendingExpense(key);
+  }
+
+  const timer = setTimeout(() => {
+    void finalizePendingExpense(key);
+  }, EXPENSE_PHOTO_WAIT_MS);
+  timer.unref();
+
+  pendingExpenses.set(key, {
+    chatId: scan.chatId,
+    telegramUserId: scan.telegramUserId,
+    title: draft.title,
+    amount: draft.total_amount,
+    currency: scan.currency,
+    walletName: scan.walletName,
+    expenseDate: draft.expense_date || currentDate(),
+    expiresAt: Date.now() + EXPENSE_PHOTO_WAIT_MS,
+    timer,
+    attachments: [attachment],
+  });
+}
+
 async function replyPersonalSummary(ctx: Context) {
   if (!ctx.from) {
     await ctx.reply('Không xác định được người gửi.');
@@ -363,6 +422,7 @@ bot.start((ctx) =>
       '1. Liên kết tài khoản: /link MA',
       '2. Kết nối nhóm với ví: /connect MA',
       '3. Gửi chi tiêu, ví dụ: rau, thịt 50k',
+      '4. Quét hoá đơn: /receipt rồi gửi ảnh hoá đơn',
       '',
       'Dùng /help để xem hướng dẫn.',
     ].join('\n')
@@ -377,6 +437,7 @@ bot.help((ctx) =>
       '/connect MA - kết nối nhóm hiện tại với một ví',
       '/disconnect - hủy kết nối nhóm hiện tại khỏi ví',
       '/wallet - xem ví đang kết nối',
+      '/receipt - quét ảnh hoá đơn để tạo khoản chi',
       '/help - xem hướng dẫn',
       '',
       'Định dạng chi tiêu:',
@@ -385,6 +446,7 @@ bot.help((ctx) =>
       'ăn sáng 35.000',
       '',
       'Sau khi gửi chi tiêu, bot sẽ luôn chờ 1 phút để bạn gửi nhiều ảnh hóa đơn. Nếu không có ảnh, khoản chi vẫn được tự lưu.',
+      'Với /receipt, bot sẽ đọc hoá đơn, hiển thị thông tin để xác nhận, rồi tự lưu sau 1 phút nếu bạn không bấm xác nhận.',
     ].join('\n')
   )
 );
@@ -495,7 +557,91 @@ bot.command('wallet', async (ctx) => {
 });
 bot.command(['me', 'summary'], replyPersonalSummary);
 
+bot.command(['receipt', 'scan'], async (ctx) => {
+  if (!ctx.from) {
+    await ctx.reply('Không xác định được người gửi.');
+    return;
+  }
+
+  if (ctx.chat.type === 'private') {
+    await ctx.reply('Hãy dùng /receipt trong nhóm đã kết nối với ví.');
+    return;
+  }
+
+  const chatId = String(ctx.chat.id);
+  const telegramUserId = String(ctx.from.id);
+  const key = pendingExpenseKey(chatId, telegramUserId);
+
+  try {
+    if (pendingExpenses.has(key)) {
+      await finalizePendingExpense(key);
+    }
+
+    const existingScan = pendingReceiptScans.get(key);
+
+    if (existingScan) {
+      clearTimeout(existingScan.timer);
+      pendingReceiptScans.delete(key);
+    }
+
+    const context = await tinoApi.getContext(telegramUserId, chatId);
+    const timer = setTimeout(() => {
+      pendingReceiptScans.delete(key);
+      void sendBotMessage(
+        chatId,
+        'Đã hết thời gian chờ ảnh hoá đơn. Gửi /receipt để thử lại.'
+      );
+    }, RECEIPT_UPLOAD_WAIT_MS);
+    timer.unref();
+
+    pendingReceiptScans.set(key, {
+      chatId,
+      telegramUserId,
+      walletName: context.wallet.name,
+      currency: context.wallet.currency,
+      expiresAt: Date.now() + RECEIPT_UPLOAD_WAIT_MS,
+      timer,
+    });
+
+    await ctx.reply(
+      [
+        '<b>Đã bật chế độ quét hoá đơn</b>',
+        htmlField('Ví', context.wallet.name),
+        '',
+        '<i>Hãy gửi 1 ảnh hoá đơn trong 2 phút. Sau khi quét xong, bot sẽ hiển thị thông tin để bạn xác nhận.</i>',
+      ].join('\n'),
+      { parse_mode: 'HTML' }
+    );
+  } catch (error) {
+    await ctx.reply(friendlyError(error));
+  }
+});
+
 bot.action(/^expense:skip-photo:(.+)$/, async (ctx) => {
+  const key = ctx.match[1];
+  const pending = pendingExpenses.get(key);
+
+  if (!pending) {
+    await ctx.answerCbQuery('Yêu cầu đã hết hạn hoặc đã được lưu.');
+    return;
+  }
+
+  if (pending.telegramUserId !== String(ctx.from.id)) {
+    await ctx.answerCbQuery('Chỉ người tạo khoản chi mới dùng được nút này.');
+    return;
+  }
+
+  if (pending.saving) {
+    await ctx.answerCbQuery('Khoản chi đang được lưu.');
+    return;
+  }
+
+  await ctx.answerCbQuery('Đang lưu khoản chi.');
+  await ctx.editMessageReplyMarkup(undefined).catch(() => undefined);
+  await finalizePendingExpense(key);
+});
+
+bot.action(/^expense:confirm-receipt:(.+)$/, async (ctx) => {
   const key = ctx.match[1];
   const pending = pendingExpenses.get(key);
 
@@ -590,6 +736,92 @@ bot.on('photo', async (ctx) => {
   const chatId = String(ctx.chat.id);
   const telegramUserId = String(ctx.from.id);
   const key = pendingExpenseKey(chatId, telegramUserId);
+  const receiptScan = pendingReceiptScans.get(key);
+
+  if (receiptScan) {
+    if (receiptScan.scanning) {
+      await ctx.reply('Mình đang đọc hoá đơn trước đó, chờ một chút nhé.');
+      return;
+    }
+
+    if (receiptScan.expiresAt <= Date.now()) {
+      clearTimeout(receiptScan.timer);
+      pendingReceiptScans.delete(key);
+      await ctx.reply('Đã hết thời gian chờ ảnh hoá đơn. Gửi /receipt để thử lại.');
+      return;
+    }
+
+    const photo = ctx.message.photo.at(-1);
+
+    if (!photo) return;
+
+    receiptScan.scanning = true;
+
+    try {
+      await ctx.reply('Đã nhận ảnh hoá đơn. Mình đang đọc dữ liệu...');
+      const fileUrl = await ctx.telegram.getFileLink(photo.file_id);
+      const downloaded = await downloadTelegramPhoto(fileUrl);
+      const attachment = {
+        bytes: downloaded.bytes,
+        contentType: downloaded.contentType.startsWith('image/')
+          ? downloaded.contentType
+          : 'image/jpeg',
+        fileName: `telegram-receipt-${photo.file_unique_id}.jpg`,
+      };
+      const draft = await tinoApi.createReceiptExpenseDraft({
+        telegram_user_id: telegramUserId,
+        telegram_chat_id: chatId,
+        bytes: attachment.bytes,
+        file_name: attachment.fileName,
+        content_type: attachment.contentType,
+      });
+
+      await createPendingExpenseFromReceipt(key, receiptScan, attachment, draft);
+      clearTimeout(receiptScan.timer);
+      pendingReceiptScans.delete(key);
+
+      const amount = draft.total_amount ?? 0;
+
+      await ctx.reply(
+        [
+          '<b>Đã đọc hoá đơn</b>',
+          htmlField('Ví', receiptScan.walletName),
+          htmlField('Nội dung', draft.title),
+          htmlField('Số tiền', formatMoney(amount, receiptScan.currency)),
+          htmlField('Ngày chi', draft.expense_date),
+          draft.merchant_name ? htmlField('Nơi bán', draft.merchant_name) : null,
+          draft.confidence !== null
+            ? htmlField('Độ tin cậy', `${Math.round(draft.confidence * 100)}%`)
+            : null,
+          '',
+          '<i>Bấm "Lưu ngay" để xác nhận. Nếu không phản hồi, bot sẽ tự lưu sau 1 phút.</i>',
+        ]
+          .filter(Boolean)
+          .join('\n'),
+        {
+          parse_mode: 'HTML',
+          reply_markup: {
+            inline_keyboard: [
+              [
+                {
+                  text: 'Lưu ngay',
+                  callback_data: `expense:confirm-receipt:${key}`,
+                },
+              ],
+            ],
+          },
+        }
+      );
+    } catch (error) {
+      receiptScan.scanning = false;
+      await ctx.reply(
+        `Không thể đọc hoá đơn: ${friendlyError(error)}\nBạn có thể gửi ảnh khác hoặc gửi /receipt để bắt đầu lại.`
+      );
+    }
+
+    return;
+  }
+
   const pending = pendingExpenses.get(key);
 
   if (!pending || pending.saving) return;
@@ -649,6 +881,7 @@ await bot.telegram.setMyCommands([
   { command: 'connect', description: 'Kết nối nhóm với ví' },
   { command: 'disconnect', description: 'Hủy kết nối nhóm khỏi ví' },
   { command: 'wallet', description: 'Xem ví đang kết nối' },
+  { command: 'receipt', description: 'Quét hoá đơn để tạo chi tiêu' },
   { command: 'help', description: 'Xem hướng dẫn' },
 ]);
 
@@ -667,6 +900,10 @@ function shutdown(signal: 'SIGINT' | 'SIGTERM') {
   clearInterval(pendingCleanupTimer);
 
   for (const pending of pendingExpenses.values()) {
+    clearTimeout(pending.timer);
+  }
+
+  for (const pending of pendingReceiptScans.values()) {
     clearTimeout(pending.timer);
   }
 
