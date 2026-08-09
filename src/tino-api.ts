@@ -73,6 +73,22 @@ type PersonalSummary = {
   }>;
 };
 
+type ScheduledSummary = {
+  telegram_chat_id: string;
+  telegram_chat_title: string | null;
+  wallet: Wallet;
+  period_start: string;
+  period_end: string;
+  total_amount: number;
+  member_balances: Array<{
+    user_id: string;
+    display_name: string;
+    paid: number;
+    share: number;
+    balance: number;
+  }>;
+};
+
 type Expense = {
   id: string;
   title: string;
@@ -217,6 +233,13 @@ export const tinoApi = {
     return post<PersonalSummary>('/bot/telegram/personal-summary', {
       telegram_user_id: telegramUserId,
       month,
+    });
+  },
+
+  getScheduledSummaries(periodStart: string, periodEnd: string) {
+    return post<ScheduledSummary[]>('/bot/telegram/scheduled-summaries', {
+      period_start: periodStart,
+      period_end: periodEnd,
     });
   },
 

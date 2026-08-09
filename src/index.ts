@@ -8,10 +8,14 @@ import { tinoApi, TinoApiError } from './tino-api.js';
 const bot = new Telegraf(config.botToken);
 const EXPENSE_PHOTO_WAIT_MS = 60_000;
 const RECEIPT_UPLOAD_WAIT_MS = 120_000;
+const SCHEDULED_SUMMARY_CHECK_MS = 60_000;
 const MAX_ATTACHMENT_SIZE = 10 * 1024 * 1024;
 const MAX_PENDING_ATTACHMENTS = 5;
+const botTimeZone = process.env.TZ || 'Asia/Bangkok';
 const port = Number(process.env.PORT || 4040);
 let botReady = false;
+let lastWeeklySummaryKey: string | null = null;
+let lastMonthlySummaryKey: string | null = null;
 
 const server = createServer((request, response) => {
   response.setHeader('content-type', 'application/json; charset=utf-8');
@@ -87,6 +91,11 @@ const pendingCleanupTimer = setInterval(() => {
 }, 30_000);
 pendingCleanupTimer.unref();
 
+const scheduledSummaryTimer = setInterval(() => {
+  void runScheduledSummaryJobs();
+}, SCHEDULED_SUMMARY_CHECK_MS);
+scheduledSummaryTimer.unref();
+
 function pendingExpenseKey(chatId: string, telegramUserId: string) {
   return `${chatId}:${telegramUserId}`;
 }
@@ -149,11 +158,69 @@ function formatMoney(amount: number, currency = 'VND') {
 
 function currentDate() {
   return new Intl.DateTimeFormat('en-CA', {
-    timeZone: process.env.TZ || 'Asia/Bangkok',
+    timeZone: botTimeZone,
     year: 'numeric',
     month: '2-digit',
     day: '2-digit',
   }).format(new Date());
+}
+
+function zonedNowParts() {
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: botTimeZone,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    hourCycle: 'h23',
+  }).formatToParts(new Date());
+  const valueByType = new Map(parts.map((part) => [part.type, part.value]));
+
+  return {
+    date: `${valueByType.get('year')}-${valueByType.get('month')}-${valueByType.get('day')}`,
+    year: Number(valueByType.get('year')),
+    month: Number(valueByType.get('month')),
+    day: Number(valueByType.get('day')),
+    hour: Number(valueByType.get('hour')),
+    minute: Number(valueByType.get('minute')),
+  };
+}
+
+function dateFromYmd(value: string) {
+  const [year, month, day] = value.split('-').map(Number);
+  return new Date(Date.UTC(year, month - 1, day));
+}
+
+function formatYmd(date: Date) {
+  return date.toISOString().slice(0, 10);
+}
+
+function addDays(value: string, days: number) {
+  const date = dateFromYmd(value);
+  date.setUTCDate(date.getUTCDate() + days);
+  return formatYmd(date);
+}
+
+function getMondayOfWeek(value: string) {
+  const date = dateFromYmd(value);
+  const dayOfWeek = date.getUTCDay();
+  const daysFromMonday = dayOfWeek === 0 ? 6 : dayOfWeek - 1;
+  date.setUTCDate(date.getUTCDate() - daysFromMonday);
+  return formatYmd(date);
+}
+
+function getMonthStart(year: number, month: number) {
+  return `${year}-${String(month).padStart(2, '0')}-01`;
+}
+
+function getNextMonthStart(year: number, month: number) {
+  const date = new Date(Date.UTC(year, month, 1));
+  return formatYmd(date);
+}
+
+function isLastDayOfMonth(parts: ReturnType<typeof zonedNowParts>) {
+  return addDays(parts.date, 1).slice(5, 7) !== parts.date.slice(5, 7);
 }
 
 function currentMonth() {
@@ -255,6 +322,97 @@ async function sendBotHtmlMessage(chatId: string, message: string) {
     await bot.telegram.sendMessage(chatId, message, { parse_mode: 'HTML' });
   } catch (error) {
     console.error('Could not send Telegram message', error);
+  }
+}
+
+function formatPeriodLabel(periodStart: string, periodEnd: string) {
+  return `${periodStart} đến ${addDays(periodEnd, -1)}`;
+}
+
+function formatSignedMoney(amount: number, currency: string) {
+  if (Math.abs(amount) <= 0.01) {
+    return formatMoney(0, currency);
+  }
+
+  return `${amount > 0 ? '+' : '-'}${formatMoney(Math.abs(amount), currency)}`;
+}
+
+async function broadcastScheduledSummary(input: {
+  kind: 'weekly' | 'monthly';
+  periodStart: string;
+  periodEnd: string;
+}) {
+  const summaries = await tinoApi.getScheduledSummaries(
+    input.periodStart,
+    input.periodEnd
+  );
+  const title =
+    input.kind === 'weekly'
+      ? 'Tổng kết chi tiêu tuần'
+      : 'Tổng kết chi tiêu tháng';
+
+  for (const summary of summaries) {
+    const memberRows = summary.member_balances.map((member) => [
+      member.display_name,
+      formatMoney(Number(member.paid), summary.wallet.currency),
+      formatMoney(Number(member.share), summary.wallet.currency),
+      formatSignedMoney(Number(member.balance), summary.wallet.currency),
+    ]);
+    const message = [
+      `<b>${escapeHtml(title)}</b>`,
+      htmlField('Ví', summary.wallet.name),
+      htmlField('Kỳ', formatPeriodLabel(summary.period_start, summary.period_end)),
+      htmlField(
+        'Tổng chi',
+        formatMoney(Number(summary.total_amount), summary.wallet.currency)
+      ),
+      '',
+      memberRows.length > 0
+        ? htmlTable(['Thành viên', 'Đã trả', 'Phần chi', 'Lệch'], memberRows)
+        : '<i>Chưa có thành viên hoạt động.</i>',
+    ].join('\n');
+
+    await sendBotHtmlMessage(summary.telegram_chat_id, message);
+  }
+}
+
+async function runScheduledSummaryJobs() {
+  if (!botReady) return;
+
+  const now = zonedNowParts();
+
+  if (now.hour !== 22 || now.minute !== 0) {
+    return;
+  }
+
+  const dayOfWeek = dateFromYmd(now.date).getUTCDay();
+
+  if (dayOfWeek === 0 && lastWeeklySummaryKey !== now.date) {
+    lastWeeklySummaryKey = now.date;
+
+    try {
+      await broadcastScheduledSummary({
+        kind: 'weekly',
+        periodStart: getMondayOfWeek(now.date),
+        periodEnd: addDays(now.date, 1),
+      });
+    } catch (error) {
+      console.error('Could not send weekly Telegram summaries', error);
+    }
+  }
+
+  if (isLastDayOfMonth(now) && lastMonthlySummaryKey !== now.date) {
+    lastMonthlySummaryKey = now.date;
+
+    try {
+      await broadcastScheduledSummary({
+        kind: 'monthly',
+        periodStart: getMonthStart(now.year, now.month),
+        periodEnd: getNextMonthStart(now.year, now.month),
+      });
+    } catch (error) {
+      console.error('Could not send monthly Telegram summaries', error);
+    }
   }
 }
 
@@ -898,6 +1056,7 @@ void bot
 function shutdown(signal: 'SIGINT' | 'SIGTERM') {
   botReady = false;
   clearInterval(pendingCleanupTimer);
+  clearInterval(scheduledSummaryTimer);
 
   for (const pending of pendingExpenses.values()) {
     clearTimeout(pending.timer);
