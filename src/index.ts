@@ -1,4 +1,4 @@
-import { createServer } from 'node:http';
+import { createServer, type IncomingMessage } from 'node:http';
 import { Telegraf } from 'telegraf';
 import type { Context } from 'telegraf';
 import { config } from './config.js';
@@ -17,6 +17,58 @@ let botReady = false;
 let lastWeeklySummaryKey: string | null = null;
 let lastMonthlySummaryKey: string | null = null;
 
+async function readJsonBody(request: IncomingMessage) {
+  const chunks: Buffer[] = [];
+  let totalBytes = 0;
+
+  for await (const chunk of request) {
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    totalBytes += buffer.byteLength;
+
+    if (totalBytes > 32 * 1024) {
+      throw new Error('Request body is too large');
+    }
+
+    chunks.push(buffer);
+  }
+
+  return JSON.parse(Buffer.concat(chunks).toString('utf8')) as unknown;
+}
+
+function isExpenseCreatedPayload(
+  value: unknown
+): value is ExpenseCreatedNotificationPayload {
+  return Boolean(
+    value &&
+      typeof value === 'object' &&
+      'telegram_chat_id' in value &&
+      typeof (value as { telegram_chat_id?: unknown }).telegram_chat_id ===
+        'string'
+  );
+}
+
+async function handleExpenseCreatedNotification(
+  payload: ExpenseCreatedNotificationPayload
+) {
+  const amount = Number(payload.total_amount ?? 0);
+  const currency = payload.currency || 'VND';
+  await bot.telegram.sendMessage(
+    String(payload.telegram_chat_id),
+    [
+      '<b>Khoản chi mới</b>',
+      htmlField('Ví', payload.wallet_name || 'Ví'),
+      htmlField('Người thêm', payload.actor_name || 'Thành viên'),
+      htmlField('Người trả', payload.payer_name || payload.actor_name || 'Thành viên'),
+      htmlField('Nội dung', payload.title || 'Khoản chi'),
+      htmlField('Số tiền', formatMoney(amount, currency)),
+      payload.expense_date ? htmlField('Ngày chi', payload.expense_date) : null,
+    ]
+      .filter(Boolean)
+      .join('\n'),
+    { parse_mode: 'HTML' }
+  );
+}
+
 const server = createServer((request, response) => {
   response.setHeader('content-type', 'application/json; charset=utf-8');
 
@@ -28,6 +80,39 @@ const server = createServer((request, response) => {
         service: 'tino-telebot',
       })
     );
+    return;
+  }
+
+  if (request.url === '/internal/telegram/expense-created') {
+    if (request.method !== 'POST') {
+      response.statusCode = 405;
+      response.end(JSON.stringify({ error: 'Method not allowed' }));
+      return;
+    }
+
+    if (request.headers['x-tino-bot-secret'] !== config.serviceSecret) {
+      response.statusCode = 401;
+      response.end(JSON.stringify({ error: 'Unauthorized' }));
+      return;
+    }
+
+    void readJsonBody(request)
+      .then(async (payload) => {
+        if (!isExpenseCreatedPayload(payload)) {
+          response.statusCode = 400;
+          response.end(JSON.stringify({ error: 'Invalid payload' }));
+          return;
+        }
+
+        await handleExpenseCreatedNotification(payload);
+        response.statusCode = 200;
+        response.end(JSON.stringify({ ok: true }));
+      })
+      .catch((error) => {
+        console.error('Could not handle expense notification', error);
+        response.statusCode = 500;
+        response.end(JSON.stringify({ error: 'Internal server error' }));
+      });
     return;
   }
 
@@ -68,6 +153,17 @@ type PendingReceiptScan = {
   expiresAt: number;
   timer: NodeJS.Timeout;
   scanning?: boolean;
+};
+
+type ExpenseCreatedNotificationPayload = {
+  telegram_chat_id?: string;
+  wallet_name?: string;
+  actor_name?: string;
+  payer_name?: string;
+  title?: string;
+  total_amount?: number;
+  currency?: string;
+  expense_date?: string;
 };
 
 const pendingExpenses = new Map<string, PendingExpense>();
